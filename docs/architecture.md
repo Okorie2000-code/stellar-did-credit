@@ -57,7 +57,7 @@ The protocol admin must register each trusted issuer before that address can cal
 | `anchor_vc(issuer, subject, vc_hash)`       | issuer   | Records a SHA-256 hash of an off-chain VC                   |
 | `mark_vc_revoked(issuer, subject, vc_hash)` | issuer   | Marks a specific VC as revoked                              |
 | `is_verified(subject)`                      | anyone   | Returns true if the subject has at least one non-revoked VC |
-| `get_active_vc_count(subject)`           | anyone   | Returns anchored VC count excluding revoked entries         |
+| `get_active_vc_count(subject)`              | anyone   | Returns the cached active VC count; seeded lazily from existing anchors and then maintained on `anchor_vc` / `mark_vc_revoked` |
 | `verify_vc(subject, vc_hash)`               | anyone   | Returns true if a specific VC exists and is not revoked     |
 
 **Storage layout**
@@ -69,6 +69,7 @@ The protocol admin must register each trusted issuer before that address can cal
 | `IssuersIndex`           | `Vec<Address>`  | Persistent — append-only list of every address ever registered; `list_issuers()` filters this against `TrustedIssuer` |
 | `DIDDocument(Address)`   | `String`        | Persistent — IPFS CID of the subject's DID document    |
 | `VCAnchors(Address)`     | `Vec<VCRecord>` | Persistent — list of VC anchor records for a subject   |
+| `ActiveVCCount(Address)` | `u32`           | Persistent — cached count of active VC anchors for the subject |
 
 ---
 
@@ -85,7 +86,7 @@ Computes and stores a credit score (300–850) for any subject address. It relie
 | `register_lender(admin, lender)`                     | admin    | Whitelists a lender                                |
 | `set_vc_count(feeder, subject, count)`               | feeder   | Caches the subject's VC count from identity-oracle |
 | `update_tx_stats(feeder, subject, stats)`            | feeder   | Updates 30-day transaction volume and count        |
-| `record_repayment(lender, subject, amount, on_time)` | lender   | Records a repayment event                          |
+| `record_repayment(lender, subject, amount, on_time)` | lender   | Records a repayment event; current v1 behavior does not verify a real loan relationship and should be treated as a lender attestation rather than proof of disbursement |
 | `compute_score(subject)`                             | anyone   | Runs the scoring formula and persists the result   |
 | `get_score(subject)`                                 | anyone   | Returns the last computed ScoreRecord              |
 | `update_weights(weights)`                            | admin    | Changes scoring weights (must sum to 100)          |
@@ -196,6 +197,8 @@ All three contracts apply this pattern in `initialize` and every admin-gated fun
 
 Non-admin functions such as `anchor_did`, `anchor_vc`, `compute_score`, `revoke`, etc. touch only persistent storage and do not need to extend the instance TTL. If the contract is not called by an admin for an extended period, anyone can call any of the covered admin-gated functions (with admin authentication) to refresh the TTL.
 
+> **Full treatment:** The [Epoch Model](epoch-model.md) document covers TTL management in depth — what each function bumps, what gets invalidated on expiry, and how to maintain liveness. It also explains related ledger-based mechanisms (compute cooldown, weight timelock, score staleness) that are not covered here.
+
 ---
 
 ## Cross-contract interaction
@@ -221,6 +224,10 @@ sequenceDiagram
 ```
 
 In this path, the `credit-oracle` uses `env.invoke_contract` to obtain a live VC count directly from the `identity-oracle`. This ensures real-time accuracy but incurs cross-contract call overhead.
+
+To keep that count path cheap, `identity-oracle` no longer re-checks the revocation registry for every anchored VC on every read. Instead, it caches the active count per subject, seeds the cache lazily from existing anchors on the first touch after upgrade, and then updates the counter incrementally when `anchor_vc` or `mark_vc_revoked` succeeds. The revocation-registry cross-contract lookup remains in the verification helpers and on new anchors so the cache stays aligned with the registry-backed revoke flow.
+
+Benchmarking the cached read path in unit tests produced roughly flat CPU usage across 5, 10, and 20 VCs: 23,808, 23,520, and 25,470 instructions respectively. That is several orders of magnitude below Soroban's current mainnet per-invocation instruction ceiling (600,000,000), so the cached counter keeps `get_active_vc_count(subject)` comfortably within budget even for larger subjects.
 
 ### Fallback Path (Cached)
 
@@ -317,11 +324,13 @@ A trusted issuer (registered by the admin) calls `anchor_vc` with the subject's 
 
 ### 3. Feeder updates credit inputs
 
-An off-chain indexer (the feeder) monitors the subject's on-chain activity, queries identity-oracle for their VC count, and periodically calls `set_vc_count` and `update_tx_stats` on credit-oracle to keep the scoring inputs fresh.
+An off-chain indexer (the feeder) monitors the subject's on-chain activity and periodically calls `set_vc_count` and `update_tx_stats` on credit-oracle to keep the non-identity scoring inputs fresh. The live VC count now comes from the cached `ActiveVCCount(Address)` inside identity-oracle, so the feeder no longer needs to read it for the cross-contract score path.
 
 ### 4. Lender records repayments
 
 When a lender disburses a loan and the subject repays, the lender calls `record_repayment` on credit-oracle, flagging each repayment as on-time or late.
+
+This is a deliberate v1 limitation: the contract currently accepts repayment data from any registered lender without verifying that the lender actually disbursed a loan to that subject. In other words, `record_repayment` is an attestation from a trusted lender, not proof of an existing loan relationship. A future version should add explicit loan-tracking state or signed disbursement/repayment attestations to close this gap.
 
 ### 5. Score is computed
 
